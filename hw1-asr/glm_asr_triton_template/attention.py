@@ -47,22 +47,9 @@ def attention_scores_kernel(
     """
     Compute scaled attention scores for a single query position.
     Grid: (batch_heads, seq_q)
-
-    *** TODO: Implement this kernel ***
     """
     pid_bh = tl.program_id(0)
     pid_q = tl.program_id(1)
-
-    # ============================================================================
-    # TODO: Implement attention score computation
-    # ============================================================================
-    #
-    # Step 1: Load query vector for this position
-    # Step 2: Load all keys for this batch_head
-    # Step 3: Compute dot-product scores and scale
-    # Step 4: Store scores
-
-    # YOUR CODE HERE
 
     offs_k = tl.arange(0, BLOCK_K)
     offs_d = tl.arange(0, BLOCK_D)
@@ -70,24 +57,25 @@ def attention_scores_kernel(
         q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2,
         mask=offs_d < head_dim,
         other=0.0,
-)
+    )
     k = tl.load(
         k_ptr
-+ pid_bh * stride_k0
-+ offs_k[:, None] * stride_k1
-+ offs_d[None, :] * stride_k2,
+        + pid_bh * stride_k0
+        + offs_k[:, None] * stride_k1
+        + offs_d[None, :] * stride_k2,
         mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
         other=0.0,
-)
+    )
     scores = tl.sum(k * q[None, :], axis=1) * scale
     tl.store(
         scores_ptr
-+ pid_bh * stride_s0
-+ pid_q * stride_s1
-+ offs_k * stride_s2,
+        + pid_bh * stride_s0
+        + pid_q * stride_s1
+        + offs_k * stride_s2,
         scores,
         mask=offs_k < seq_k,
-)
+    )
+
 
 @triton.jit
 def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr):
@@ -97,16 +85,6 @@ def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr
     """
     row = tl.program_id(0)
 
-    # ============================================================================
-    # TODO: Implement softmax
-    # ============================================================================
-    #
-    # Step 1: Load scores row with masking
-    # Step 2: Subtract max for stability
-    # Step 3: Compute exp and normalize
-    # Step 4: Store back
-
-    # YOUR CODE HERE
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < seq_k
     s = tl.load(scores_ptr + row * stride_s + offs, mask=mask, other=-float("inf"))
@@ -115,7 +93,56 @@ def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr
     denom = tl.sum(exp_s, axis=0)
     out = exp_s / denom
     tl.store(scores_ptr + row * stride_s + offs, out, mask=mask)
-    
+
+
+# ============================================================================
+# Optimization 2: Fused attention scores + softmax kernel
+# Eliminates one global memory write+read cycle by computing scores and
+# applying softmax entirely in registers before writing to global memory.
+# ============================================================================
+
+@triton.jit
+def fused_scores_softmax_kernel(
+    q_ptr, k_ptr, scores_ptr,
+    scale, seq_k, head_dim,
+    stride_q0, stride_q1, stride_q2,
+    stride_k0, stride_k1, stride_k2,
+    stride_s0, stride_s1, stride_s2,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Fused attention scores + softmax in one kernel. Grid: (batch_heads, seq_q)."""
+    pid_bh = tl.program_id(0)
+    pid_q = tl.program_id(1)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    # Load query vector (stays in registers)
+    q = tl.load(
+        q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2,
+        mask=offs_d < head_dim, other=0.0,
+    )
+
+    # Load keys and compute dot-product scores
+    k = tl.load(
+        k_ptr + pid_bh * stride_k0 + offs_k[:, None] * stride_k1 + offs_d[None, :] * stride_k2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0,
+    )
+    scores = tl.sum(k * q[None, :], axis=1) * scale
+
+    # Numerically stable softmax directly on register values
+    mask_k = offs_k < seq_k
+    scores = tl.where(mask_k, scores, -float("inf"))
+    scores = scores - tl.max(scores, axis=0)
+    exp_s = tl.exp(scores)
+    softmax_out = exp_s / tl.sum(exp_s, axis=0)
+
+    # Single write to global memory (instead of write scores + read scores + write softmax)
+    tl.store(
+        scores_ptr + pid_bh * stride_s0 + pid_q * stride_s1 + offs_k * stride_s2,
+        softmax_out, mask=mask_k,
+    )
 
 
 @triton.jit
@@ -144,44 +171,33 @@ def attention_output_kernel(
     pid_bh = tl.program_id(0)
     pid_q = tl.program_id(1)
 
-    # ============================================================================
-    # TODO: Implement attention output computation
-    # ============================================================================
-    #
-    # Step 1: Load attention weights for this query
-    # Step 2: Load all values for this batch_head
-    # Step 3: Compute weighted sum
-    # Step 4: Store output
-
-    # YOUR CODE HERE
     offs_k = tl.arange(0, BLOCK_K)
     offs_d = tl.arange(0, BLOCK_D)
     w = tl.load(
         attn_ptr
-+ pid_bh * stride_w0
-+ pid_q * stride_w1
-+ offs_k * stride_w2,
+        + pid_bh * stride_w0
+        + pid_q * stride_w1
+        + offs_k * stride_w2,
         mask=offs_k < seq_k,
         other=0.0,
-)
+    )
     v = tl.load(
         v_ptr
-+ pid_bh * stride_v0
-+ offs_k[:, None] * stride_v1
-+ offs_d[None, :] * stride_v2,
+        + pid_bh * stride_v0
+        + offs_k[:, None] * stride_v1
+        + offs_d[None, :] * stride_v2,
         mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
         other=0.0,
-)
+    )
     out = tl.sum(v * w[:, None], axis=0)
     tl.store(
         output_ptr
-+ pid_bh * stride_o0
-+ pid_q * stride_o1
-+ offs_d * stride_o2,
+        + pid_bh * stride_o0
+        + pid_q * stride_o1
+        + offs_d * stride_o2,
         out,
         mask=offs_d < head_dim,
-)
-
+    )
 
 
 @triton.jit
@@ -321,8 +337,6 @@ def scaled_dot_product_attention(
     )
 
     if use_triton:
-        #optimization 1: print debug 
-        #print(f"[TUNED] Attention: warps=(4,8,4) stages=(3,2,2) seq_k={seq_k} head_dim={head_dim}")
         q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32)
         k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
         v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
@@ -358,81 +372,85 @@ def scaled_dot_product_attention(
         )
 
         grid = (batch * num_heads, seq_q)
-        attention_scores_kernel[grid](
-            q_flat,
-            k_flat,
-            scores,
-            float(scale),
-            seq_k_padded,
-            head_dim_padded,
-            q_flat.stride(0),
-            q_flat.stride(1),
-            q_flat.stride(2),
-            k_flat.stride(0),
-            k_flat.stride(1),
-            k_flat.stride(2),
-            scores.stride(0),
-            scores.stride(1),
-            scores.stride(2),
-            BLOCK_K=seq_k_padded,
-            BLOCK_D=head_dim_padded,
-            # optimization 1 , numbers from testing sript
-            num_warps=8,
-            num_stages=2,
-        )
 
-        if seq_k_padded != seq_k:
-            scores[:, :, seq_k:] = -1e9
+        # Optimization 2: Use fused scores+softmax when no masking is needed.
+        # The audio encoder (32 layers) has no causal mask and no attention mask,
+        # so it takes the fast fused path. The text decoder uses causal masking
+        # and falls back to the separate kernel path.
+        needs_masking = is_causal or attention_mask is not None or seq_k_padded != seq_k
 
-        if is_causal:
-            mask = torch.triu(
-                torch.ones((seq_q, seq_k_padded), dtype=torch.float32, device=q.device),
-                diagonal=1,
-            ) * -1e9
-            scores = scores + mask[None, :, :]
+        if not needs_masking:
+            # FUSED PATH: scores + softmax in one kernel, no global memory round-trip
+            fused_scores_softmax_kernel[grid](
+                q_flat, k_flat, scores,
+                float(scale), seq_k_padded, head_dim_padded,
+                q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
+                k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
+                scores.stride(0), scores.stride(1), scores.stride(2),
+                BLOCK_K=seq_k_padded,
+                BLOCK_D=head_dim_padded,
+                num_warps=4,
+                num_stages=2,
+            )
+        else:
+            # SEPARATE PATH: masking required between scores and softmax
+            attention_scores_kernel[grid](
+                q_flat, k_flat, scores,
+                float(scale), seq_k_padded, head_dim_padded,
+                q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
+                k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
+                scores.stride(0), scores.stride(1), scores.stride(2),
+                BLOCK_K=seq_k_padded,
+                BLOCK_D=head_dim_padded,
+                # Optimization 1: tuned launch config
+                num_warps=8,
+                num_stages=2,
+            )
 
-        if attention_mask is not None:
-            if attention_mask.ndim == 4:
-                attention_mask = attention_mask.reshape(
-                    batch * num_heads, seq_q, seq_k
-                )
             if seq_k_padded != seq_k:
-                mask_padded = torch.zeros(
-                    (batch * num_heads, seq_q, seq_k_padded),
-                    dtype=torch.float32,
-                    device=q.device,
-                )
-                mask_padded[:, :, :seq_k] = attention_mask
-                mask_padded[:, :, seq_k:] = -1e9
-                attention_mask = mask_padded
-            scores = scores + attention_mask
+                scores[:, :, seq_k:] = -1e9
 
-        scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
-        block = seq_k_padded
-        # optimization 1 : added the same warps and stages 
-        softmax_inplace_kernel[(scores_2d.shape[0],)](
-            scores_2d, scores_2d.stride(0), seq_k_padded, BLOCK_SIZE=block,num_warps=2,num_stages=2,
-        )
-        scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
+            if is_causal:
+                mask = torch.triu(
+                    torch.ones((seq_q, seq_k_padded), dtype=torch.float32, device=q.device),
+                    diagonal=1,
+                ) * -1e9
+                scores = scores + mask[None, :, :]
+
+            if attention_mask is not None:
+                if attention_mask.ndim == 4:
+                    attention_mask = attention_mask.reshape(
+                        batch * num_heads, seq_q, seq_k
+                    )
+                if seq_k_padded != seq_k:
+                    mask_padded = torch.zeros(
+                        (batch * num_heads, seq_q, seq_k_padded),
+                        dtype=torch.float32,
+                        device=q.device,
+                    )
+                    mask_padded[:, :, :seq_k] = attention_mask
+                    mask_padded[:, :, seq_k:] = -1e9
+                    attention_mask = mask_padded
+                scores = scores + attention_mask
+
+            scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
+            softmax_inplace_kernel[(scores_2d.shape[0],)](
+                scores_2d, scores_2d.stride(0), seq_k_padded, BLOCK_SIZE=seq_k_padded,
+                # Optimization 1: tuned launch config
+                num_warps=2,
+                num_stages=2,
+            )
+            scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
 
         attention_output_kernel[grid](
-            scores,
-            v_flat,
-            output,
-            seq_k_padded,
-            head_dim_padded,
-            scores.stride(0),
-            scores.stride(1),
-            scores.stride(2),
-            v_flat.stride(0),
-            v_flat.stride(1),
-            v_flat.stride(2),
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
+            scores, v_flat, output,
+            seq_k_padded, head_dim_padded,
+            scores.stride(0), scores.stride(1), scores.stride(2),
+            v_flat.stride(0), v_flat.stride(1), v_flat.stride(2),
+            output.stride(0), output.stride(1), output.stride(2),
             BLOCK_K=seq_k_padded,
             BLOCK_D=head_dim_padded,
-            #optimization 1: 
+            # Optimization 1: tuned launch config
             num_warps=4,
             num_stages=3,
         )
