@@ -894,6 +894,9 @@ def softmax(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
             output.stride(0),
             seq_len,
             BLOCK_SIZE=block,
+            #optimization 1: block size 
+            num_warps=1,
+            num_stages=2,
         )
         result = output.reshape(original_shape)
     else:

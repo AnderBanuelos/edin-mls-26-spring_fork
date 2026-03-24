@@ -321,6 +321,8 @@ def scaled_dot_product_attention(
     )
 
     if use_triton:
+        #optimization 1: print debug 
+        #print(f"[TUNED] Attention: warps=(4,8,4) stages=(3,2,2) seq_k={seq_k} head_dim={head_dim}")
         q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32)
         k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
         v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
@@ -374,6 +376,9 @@ def scaled_dot_product_attention(
             scores.stride(2),
             BLOCK_K=seq_k_padded,
             BLOCK_D=head_dim_padded,
+            # optimization 1 , numbers from testing sript
+            num_warps=8,
+            num_stages=2,
         )
 
         if seq_k_padded != seq_k:
@@ -404,8 +409,9 @@ def scaled_dot_product_attention(
 
         scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
         block = seq_k_padded
+        # optimization 1 : added the same warps and stages 
         softmax_inplace_kernel[(scores_2d.shape[0],)](
-            scores_2d, scores_2d.stride(0), seq_k_padded, BLOCK_SIZE=block
+            scores_2d, scores_2d.stride(0), seq_k_padded, BLOCK_SIZE=block,num_warps=2,num_stages=2,
         )
         scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
 
@@ -426,6 +432,9 @@ def scaled_dot_product_attention(
             output.stride(2),
             BLOCK_K=seq_k_padded,
             BLOCK_D=head_dim_padded,
+            #optimization 1: 
+            num_warps=4,
+            num_stages=3,
         )
 
         if head_dim_padded != head_dim:

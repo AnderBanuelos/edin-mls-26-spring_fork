@@ -128,7 +128,7 @@ def load_test_audio(audio_path=None):
     return audio_array.astype(np.float32), EXPECTED_TEXT, duration
 
 
-def benchmark_cutile_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
+def benchmark_cutile_folder(folder_name, audio_array, num_warmup=1, num_runs=10):
     """Benchmark a CuTile implementation folder."""
     import cupy as cp
 
