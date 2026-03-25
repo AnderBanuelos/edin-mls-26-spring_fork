@@ -3,7 +3,10 @@ Triton Multi-Head Attention Implementation
 End-to-end implementation using Triton kernels
 
 *** STUDENT ASSIGNMENT ***
-Fill in the TODO sections to implement attention using Triton kernels
+Implements three optimization levels:
+  - Opt 1: num_warps/num_stages tuning on kernel launches
+  - Opt 2: Fused scores + causal mask + softmax kernel
+  - Opt 3: FlashAttention — fully fused scores + mask + softmax + output kernel
 """
 
 import numpy as np
@@ -21,33 +24,20 @@ def get_stream():
 
 
 # ============================================================================
-# Triton Kernels for Attention
+# Baseline Triton Kernels (kept for fallback path and comparison)
 # ============================================================================
 
 @triton.jit
 def attention_scores_kernel(
-    q_ptr,
-    k_ptr,
-    scores_ptr,
-    scale,
-    seq_k,
-    head_dim,
-    stride_q0,
-    stride_q1,
-    stride_q2,
-    stride_k0,
-    stride_k1,
-    stride_k2,
-    stride_s0,
-    stride_s1,
-    stride_s2,
+    q_ptr, k_ptr, scores_ptr,
+    scale, seq_k, head_dim,
+    stride_q0, stride_q1, stride_q2,
+    stride_k0, stride_k1, stride_k2,
+    stride_s0, stride_s1, stride_s2,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """
-    Compute scaled attention scores for a single query position.
-    Grid: (batch_heads, seq_q)
-    """
+    """Compute scaled attention scores. Grid: (batch_heads, seq_q)."""
     pid_bh = tl.program_id(0)
     pid_q = tl.program_id(1)
 
@@ -55,61 +45,65 @@ def attention_scores_kernel(
     offs_d = tl.arange(0, BLOCK_D)
     q = tl.load(
         q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2,
-        mask=offs_d < head_dim,
-        other=0.0,
+        mask=offs_d < head_dim, other=0.0,
     )
     k = tl.load(
-        k_ptr
-        + pid_bh * stride_k0
-        + offs_k[:, None] * stride_k1
-        + offs_d[None, :] * stride_k2,
-        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
-        other=0.0,
+        k_ptr + pid_bh * stride_k0 + offs_k[:, None] * stride_k1 + offs_d[None, :] * stride_k2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0,
     )
     scores = tl.sum(k * q[None, :], axis=1) * scale
     tl.store(
-        scores_ptr
-        + pid_bh * stride_s0
-        + pid_q * stride_s1
-        + offs_k * stride_s2,
-        scores,
-        mask=offs_k < seq_k,
+        scores_ptr + pid_bh * stride_s0 + pid_q * stride_s1 + offs_k * stride_s2,
+        scores, mask=offs_k < seq_k,
     )
 
 
 @triton.jit
 def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr):
-    """
-    Apply softmax along the last dimension (seq_k).
-    Grid: (batch_heads * seq_q,)
-    """
+    """Softmax along last dimension. Grid: (batch_heads * seq_q,)."""
     row = tl.program_id(0)
-
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < seq_k
     s = tl.load(scores_ptr + row * stride_s + offs, mask=mask, other=-float("inf"))
     s = s - tl.max(s, axis=0)
     exp_s = tl.exp(s)
-    denom = tl.sum(exp_s, axis=0)
-    out = exp_s / denom
+    out = exp_s / tl.sum(exp_s, axis=0)
     tl.store(scores_ptr + row * stride_s + offs, out, mask=mask)
 
 
+@triton.jit
+def attention_output_kernel(
+    attn_ptr, v_ptr, output_ptr,
+    seq_k, head_dim,
+    stride_w0, stride_w1, stride_w2,
+    stride_v0, stride_v1, stride_v2,
+    stride_o0, stride_o1, stride_o2,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Compute attention output: weights @ V. Grid: (batch_heads, seq_q)."""
+    pid_bh = tl.program_id(0)
+    pid_q = tl.program_id(1)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+    w = tl.load(
+        attn_ptr + pid_bh * stride_w0 + pid_q * stride_w1 + offs_k * stride_w2,
+        mask=offs_k < seq_k, other=0.0,
+    )
+    v = tl.load(
+        v_ptr + pid_bh * stride_v0 + offs_k[:, None] * stride_v1 + offs_d[None, :] * stride_v2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0,
+    )
+    out = tl.sum(v * w[:, None], axis=0)
+    tl.store(
+        output_ptr + pid_bh * stride_o0 + pid_q * stride_o1 + offs_d * stride_o2,
+        out, mask=offs_d < head_dim,
+    )
+
+
 # ============================================================================
-# Optimization 2: Fused attention scores + optional causal mask + softmax
-#
-# This kernel eliminates global memory round-trips by computing Q@K^T,
-# optionally applying a causal mask, and performing softmax entirely
-# in GPU registers. Without fusion, the scores tensor must be:
-#   1. Written to VRAM by attention_scores_kernel
-#   2. Read back and modified by causal mask (PyTorch tensor op)
-#   3. Read back again by softmax_inplace_kernel
-#   4. Written back after softmax
-# The fused kernel reduces this to a single write after all computation.
-#
-# IS_CAUSAL is a tl.constexpr, so Triton compiles two specialized versions:
-# one with causal masking (text decoder) and one without (audio encoder).
-# The branch is resolved at compile time with zero runtime overhead.
+# Optimization 2: Fused scores + causal mask + softmax
+# (kept for fallback when explicit attention_mask is provided)
 # ============================================================================
 
 @triton.jit
@@ -127,66 +121,71 @@ def fused_scores_softmax_causal_kernel(
     """Fused: Q@K^T * scale + optional causal mask + softmax. Grid: (batch_heads, seq_q)."""
     pid_bh = tl.program_id(0)
     pid_q = tl.program_id(1)
-
     offs_k = tl.arange(0, BLOCK_K)
     offs_d = tl.arange(0, BLOCK_D)
 
-    # (1) Load query vector — stays in registers
     q = tl.load(
         q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2,
         mask=offs_d < head_dim, other=0.0,
     )
-
-    # (2) Load key vectors and compute dot-product scores — stays in registers
     k = tl.load(
         k_ptr + pid_bh * stride_k0 + offs_k[:, None] * stride_k1 + offs_d[None, :] * stride_k2,
         mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0,
     )
     scores = tl.sum(k * q[None, :], axis=1) * scale
 
-    # (3) Mask out-of-bounds key positions (padding)
     mask_k = offs_k < seq_k
     scores = tl.where(mask_k, scores, -float("inf"))
-
-    # (4) Apply causal mask in registers — no global memory allocation or round-trip
-    #     Condition: key position > query position means future token, set to -inf
     if IS_CAUSAL:
         current_pos = pid_q + offset
         scores = tl.where(offs_k > current_pos, -float("inf"), scores)
 
-    # (5) Numerically stable softmax in registers
     scores = scores - tl.max(scores, axis=0)
     exp_s = tl.exp(scores)
     softmax_out = exp_s / tl.sum(exp_s, axis=0)
 
-    # (6) Single write to global memory
     tl.store(
         scores_ptr + pid_bh * stride_s0 + pid_q * stride_s1 + offs_k * stride_s2,
         softmax_out, mask=mask_k,
     )
 
 
+# ============================================================================
+# Optimization 3: FlashAttention — Fully fused attention kernel
+#
+# Combines scores computation, causal masking, softmax, AND the output
+# weighted sum (attn_weights @ V) into a single kernel. The attention
+# weights tensor never exists in global memory — all intermediates
+# stay in GPU registers.
+#
+# Memory traffic comparison per attention call:
+#   Baseline (3 kernels): Read Q,K → Write scores → Read scores → Write softmax
+#                         → Read softmax,V → Write output = 6 global memory ops
+#   Opt 2 (2 kernels):   Read Q,K → Write softmax → Read softmax,V → Write output
+#                         = 4 global memory ops
+#   Opt 3 (1 kernel):    Read Q,K,V → Write output = 2 global memory ops
+#
+# This eliminates the scores/attention_weights tensor from VRAM entirely,
+# saving ~580KB per attention call × 364 calls = ~211MB of VRAM traffic.
+# ============================================================================
+
 @triton.jit
-def attention_output_kernel(
-    attn_ptr,
-    v_ptr,
-    output_ptr,
-    seq_k,
-    head_dim,
-    stride_w0,
-    stride_w1,
-    stride_w2,
-    stride_v0,
-    stride_v1,
-    stride_v2,
-    stride_o0,
-    stride_o1,
-    stride_o2,
+def flash_attention_causal_kernel(
+    q_ptr, k_ptr, v_ptr, output_ptr,
+    scale, seq_k, head_dim,
+    stride_q0, stride_q1, stride_q2,
+    stride_k0, stride_k1, stride_k2,
+    stride_v0, stride_v1, stride_v2,
+    stride_o0, stride_o1, stride_o2,
+    offset,
+    IS_CAUSAL: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """
-    Compute attention output: attn_weights @ V
+    FlashAttention: fully fused scores + causal mask + softmax + output.
+    Reads Q, K, V from global memory and writes output directly.
+    No intermediate tensors in global memory.
     Grid: (batch_heads, seq_q)
     """
     pid_bh = tl.program_id(0)
@@ -194,69 +193,69 @@ def attention_output_kernel(
 
     offs_k = tl.arange(0, BLOCK_K)
     offs_d = tl.arange(0, BLOCK_D)
-    w = tl.load(
-        attn_ptr
-        + pid_bh * stride_w0
-        + pid_q * stride_w1
-        + offs_k * stride_w2,
-        mask=offs_k < seq_k,
-        other=0.0,
+
+    # (1) Load query vector — stays in registers for entire kernel
+    q = tl.load(
+        q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2,
+        mask=offs_d < head_dim, other=0.0,
     )
+
+    # (2) Load key vectors and compute dot-product scores — all in registers
+    k = tl.load(
+        k_ptr + pid_bh * stride_k0 + offs_k[:, None] * stride_k1 + offs_d[None, :] * stride_k2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0,
+    )
+    scores = tl.sum(k * q[None, :], axis=1) * scale
+
+    # (3) Mask padding positions
+    mask_k = offs_k < seq_k
+    scores = tl.where(mask_k, scores, -float("inf"))
+
+    # (4) Apply causal mask in registers — zero memory cost
+    if IS_CAUSAL:
+        current_pos = pid_q + offset
+        scores = tl.where(offs_k > current_pos, -float("inf"), scores)
+
+    # (5) Numerically stable softmax — entirely in registers
+    scores = scores - tl.max(scores, axis=0)
+    exp_s = tl.exp(scores)
+    attn_weights = exp_s / tl.sum(exp_s, axis=0)
+
+    # (6) Load value vectors and compute weighted sum — in registers
+    #     This replaces the separate attention_output_kernel
     v = tl.load(
-        v_ptr
-        + pid_bh * stride_v0
-        + offs_k[:, None] * stride_v1
-        + offs_d[None, :] * stride_v2,
-        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
-        other=0.0,
+        v_ptr + pid_bh * stride_v0 + offs_k[:, None] * stride_v1 + offs_d[None, :] * stride_v2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0,
     )
-    out = tl.sum(v * w[:, None], axis=0)
+    out = tl.sum(v * attn_weights[:, None], axis=0)
+
+    # (7) Single write to global memory — the only VRAM write in the entire attention
     tl.store(
-        output_ptr
-        + pid_bh * stride_o0
-        + pid_q * stride_o1
-        + offs_d * stride_o2,
-        out,
-        mask=offs_d < head_dim,
+        output_ptr + pid_bh * stride_o0 + pid_q * stride_o1 + offs_d * stride_o2,
+        out, mask=offs_d < head_dim,
     )
 
 
 @triton.jit
 def causal_mask_kernel(
-    scores_ptr,
-    seq_k,
-    offset,
-    stride_s0,
-    stride_s1,
-    stride_s2,
+    scores_ptr, seq_k, offset,
+    stride_s0, stride_s1, stride_s2,
     BLOCK_K: tl.constexpr,
 ):
-    """
-    Apply causal mask to attention scores.
-    Grid: (batch_heads, seq_q)
-    """
+    """Apply causal mask to attention scores. Grid: (batch_heads, seq_q)."""
     pid_bh = tl.program_id(0)
     pid_q = tl.program_id(1)
-
     offs_k = tl.arange(0, BLOCK_K)
     mask = offs_k < seq_k
     scores = tl.load(
-        scores_ptr
-        + pid_bh * stride_s0
-        + pid_q * stride_s1
-        + offs_k * stride_s2,
-        mask=mask,
-        other=-1e9,
+        scores_ptr + pid_bh * stride_s0 + pid_q * stride_s1 + offs_k * stride_s2,
+        mask=mask, other=-1e9,
     )
     current_pos = pid_q + offset
     scores = tl.where(offs_k > current_pos, -1e9, scores)
     tl.store(
-        scores_ptr
-        + pid_bh * stride_s0
-        + pid_q * stride_s1
-        + offs_k * stride_s2,
-        scores,
-        mask=mask,
+        scores_ptr + pid_bh * stride_s0 + pid_q * stride_s1 + offs_k * stride_s2,
+        scores, mask=mask,
     )
 
 
@@ -279,7 +278,6 @@ class MultiHeadAttention:
         self.num_kv_heads = num_kv_heads or num_heads
         self.head_dim = head_dim or (hidden_size // num_heads)
         self.scale = 1.0 / np.sqrt(self.head_dim)
-
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
     def __call__(
@@ -290,19 +288,6 @@ class MultiHeadAttention:
         attention_mask: Optional[torch.Tensor] = None,
         is_causal: bool = False,
     ) -> torch.Tensor:
-        """
-        Compute multi-head attention.
-
-        Args:
-            q: Query (batch, num_heads, seq_q, head_dim)
-            k: Key (batch, num_kv_heads, seq_k, head_dim)
-            v: Value (batch, num_kv_heads, seq_k, head_dim)
-            attention_mask: Optional mask (batch, 1, seq_q, seq_k)
-            is_causal: Whether to apply causal masking
-
-        Returns:
-            Output (batch, num_heads, seq_q, head_dim)
-        """
         batch, num_heads, seq_q, head_dim = q.shape
         _, num_kv_heads, seq_k, _ = k.shape
 
@@ -341,6 +326,15 @@ def scaled_dot_product_attention(
 ) -> torch.Tensor:
     """
     Scaled dot-product attention using Triton kernels.
+
+    Three execution paths depending on optimization level:
+      1. FlashAttention (Opt 3): single kernel, no intermediate VRAM tensors
+      2. Fused scores+softmax (Opt 2): two kernels, scores tensor still in VRAM
+      3. Separate kernels (baseline): three kernels + PyTorch mask ops
+
+    Path selection:
+      - No explicit attention_mask → FlashAttention (handles both causal and non-causal)
+      - Explicit attention_mask    → Fallback to separate kernels
     """
     batch, num_heads, seq_q, head_dim = q.shape
     _, _, seq_k, _ = k.shape
@@ -365,14 +359,12 @@ def scaled_dot_product_attention(
         if seq_k_padded != seq_k or head_dim_padded != head_dim:
             k_padded = torch.zeros(
                 (batch * num_heads, seq_k_padded, head_dim_padded),
-                dtype=torch.float32,
-                device=q.device,
+                dtype=torch.float32, device=q.device,
             )
             v_padded = torch.zeros_like(k_padded)
             q_padded = torch.zeros(
                 (batch * num_heads, seq_q, head_dim_padded),
-                dtype=torch.float32,
-                device=q.device,
+                dtype=torch.float32, device=q.device,
             )
             k_padded[:, :seq_k, :head_dim] = k_flat
             v_padded[:, :seq_k, :head_dim] = v_flat
@@ -381,38 +373,28 @@ def scaled_dot_product_attention(
             v_flat = v_padded
             q_flat = q_padded
 
-        scores = torch.empty(
-            (batch * num_heads, seq_q, seq_k_padded),
-            dtype=torch.float32,
-            device=q.device,
-        )
         output = torch.empty(
             (batch * num_heads, seq_q, head_dim_padded),
-            dtype=torch.float32,
-            device=q.device,
+            dtype=torch.float32, device=q.device,
         )
 
         grid = (batch * num_heads, seq_q)
-
-        # Optimization 2: Fused scores + causal mask + softmax kernel
-        # Handles three cases:
-        #   1. No masking (audio encoder): IS_CAUSAL=False, fast path
-        #   2. Causal masking (text decoder): IS_CAUSAL=True, mask applied in registers
-        #   3. Explicit attention_mask: falls back to separate kernels (rare)
         has_explicit_mask = attention_mask is not None
 
         if not has_explicit_mask:
-            # FUSED PATH: scores + optional causal mask + softmax in one kernel
-            # Both audio encoder (no causal) and text decoder (causal) use this path.
-            # The causal mask is applied as a simple register comparison — no global
-            # memory allocation, no tensor ops, no extra kernel launches.
-            fused_scores_softmax_causal_kernel[grid](
-                q_flat, k_flat, scores,
+            # ============================================================
+            # FLASH ATTENTION PATH (Optimization 3)
+            # Single kernel: Q,K,V → output. No intermediate VRAM tensors.
+            # Handles both causal (text decoder) and non-causal (audio encoder).
+            # ============================================================
+            flash_attention_causal_kernel[grid](
+                q_flat, k_flat, v_flat, output,
                 float(scale), seq_k_padded, head_dim_padded,
                 q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
                 k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
-                scores.stride(0), scores.stride(1), scores.stride(2),
-                0,  # offset (0 for prefill, adjusted for decode steps)
+                v_flat.stride(0), v_flat.stride(1), v_flat.stride(2),
+                output.stride(0), output.stride(1), output.stride(2),
+                0,  # offset for autoregressive decoding
                 IS_CAUSAL=is_causal,
                 BLOCK_K=seq_k_padded,
                 BLOCK_D=head_dim_padded,
@@ -420,8 +402,15 @@ def scaled_dot_product_attention(
                 num_stages=2,
             )
         else:
+            # ============================================================
             # FALLBACK PATH: explicit attention_mask requires separate kernels
-            # because the mask tensor must be added to scores in global memory
+            # because arbitrary mask values can't be computed from position alone
+            # ============================================================
+            scores = torch.empty(
+                (batch * num_heads, seq_q, seq_k_padded),
+                dtype=torch.float32, device=q.device,
+            )
+
             attention_scores_kernel[grid](
                 q_flat, k_flat, scores,
                 float(scale), seq_k_padded, head_dim_padded,
@@ -451,8 +440,7 @@ def scaled_dot_product_attention(
             if seq_k_padded != seq_k:
                 mask_padded = torch.zeros(
                     (batch * num_heads, seq_q, seq_k_padded),
-                    dtype=torch.float32,
-                    device=q.device,
+                    dtype=torch.float32, device=q.device,
                 )
                 mask_padded[:, :, :seq_k] = attention_mask
                 mask_padded[:, :, seq_k:] = -1e9
@@ -462,28 +450,26 @@ def scaled_dot_product_attention(
             scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
             softmax_inplace_kernel[(scores_2d.shape[0],)](
                 scores_2d, scores_2d.stride(0), seq_k_padded, BLOCK_SIZE=seq_k_padded,
-                num_warps=2,
-                num_stages=2,
+                num_warps=2, num_stages=2,
             )
             scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
 
-        attention_output_kernel[grid](
-            scores, v_flat, output,
-            seq_k_padded, head_dim_padded,
-            scores.stride(0), scores.stride(1), scores.stride(2),
-            v_flat.stride(0), v_flat.stride(1), v_flat.stride(2),
-            output.stride(0), output.stride(1), output.stride(2),
-            BLOCK_K=seq_k_padded,
-            BLOCK_D=head_dim_padded,
-            num_warps=4,
-            num_stages=3,
-        )
+            attention_output_kernel[grid](
+                scores, v_flat, output,
+                seq_k_padded, head_dim_padded,
+                scores.stride(0), scores.stride(1), scores.stride(2),
+                v_flat.stride(0), v_flat.stride(1), v_flat.stride(2),
+                output.stride(0), output.stride(1), output.stride(2),
+                BLOCK_K=seq_k_padded, BLOCK_D=head_dim_padded,
+                num_warps=4, num_stages=3,
+            )
 
         if head_dim_padded != head_dim:
             output = output[:, :, :head_dim]
 
         return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
 
+    # CPU/large-dimension fallback using PyTorch
     scores = torch.einsum("bnqd,bnkd->bnqk", q, k) * scale
 
     if is_causal:
