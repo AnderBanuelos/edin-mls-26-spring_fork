@@ -6,7 +6,7 @@ End-to-end implementation using Triton kernels
 Implements three optimization levels:
   - Opt 1: num_warps/num_stages tuning on kernel launches
   - Opt 2: Fused scores + causal mask + softmax kernel
-  - Opt 3: FlashAttention — fully fused scores + mask + softmax + output kernel
+  - Opt 3: True FlashAttention with tiled K/V and online softmax (Dao et al., 2022)
 """
 
 import numpy as np
@@ -40,7 +40,6 @@ def attention_scores_kernel(
     """Compute scaled attention scores. Grid: (batch_heads, seq_q)."""
     pid_bh = tl.program_id(0)
     pid_q = tl.program_id(1)
-
     offs_k = tl.arange(0, BLOCK_K)
     offs_d = tl.arange(0, BLOCK_D)
     q = tl.load(
@@ -102,8 +101,7 @@ def attention_output_kernel(
 
 
 # ============================================================================
-# Optimization 2: Fused scores + causal mask + softmax
-# (kept for fallback when explicit attention_mask is provided)
+# Optimization 2: Fused scores + causal mask + softmax (kept for reference)
 # ============================================================================
 
 @triton.jit
@@ -123,7 +121,6 @@ def fused_scores_softmax_causal_kernel(
     pid_q = tl.program_id(1)
     offs_k = tl.arange(0, BLOCK_K)
     offs_d = tl.arange(0, BLOCK_D)
-
     q = tl.load(
         q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2,
         mask=offs_d < head_dim, other=0.0,
@@ -133,17 +130,14 @@ def fused_scores_softmax_causal_kernel(
         mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0,
     )
     scores = tl.sum(k * q[None, :], axis=1) * scale
-
     mask_k = offs_k < seq_k
     scores = tl.where(mask_k, scores, -float("inf"))
     if IS_CAUSAL:
         current_pos = pid_q + offset
         scores = tl.where(offs_k > current_pos, -float("inf"), scores)
-
     scores = scores - tl.max(scores, axis=0)
     exp_s = tl.exp(scores)
     softmax_out = exp_s / tl.sum(exp_s, axis=0)
-
     tl.store(
         scores_ptr + pid_bh * stride_s0 + pid_q * stride_s1 + offs_k * stride_s2,
         softmax_out, mask=mask_k,
@@ -151,88 +145,175 @@ def fused_scores_softmax_causal_kernel(
 
 
 # ============================================================================
-# Optimization 3: FlashAttention — Fully fused attention kernel
+# Optimization 3: True FlashAttention with Tiled K/V and Online Softmax
 #
-# Combines scores computation, causal masking, softmax, AND the output
-# weighted sum (attn_weights @ V) into a single kernel. The attention
-# weights tensor never exists in global memory — all intermediates
-# stay in GPU registers.
+# Core idea from Dao et al., "FlashAttention: Fast and Memory-Efficient
+# Exact Attention with IO-Awareness" (NeurIPS 2022):
 #
-# Memory traffic comparison per attention call:
-#   Baseline (3 kernels): Read Q,K → Write scores → Read scores → Write softmax
-#                         → Read softmax,V → Write output = 6 global memory ops
-#   Opt 2 (2 kernels):   Read Q,K → Write softmax → Read softmax,V → Write output
-#                         = 4 global memory ops
-#   Opt 3 (1 kernel):    Read Q,K,V → Write output = 2 global memory ops
+#   Instead of loading all keys/values at once (which requires O(seq^2)
+#   register space and limits max sequence length), we tile along the
+#   K/V sequence dimension in blocks of BLOCK_N. Each iteration:
+#     - Loads a block of K (BLOCK_N keys)
+#     - Computes partial scores for that block
+#     - Updates a running softmax using the "online softmax" algorithm
+#     - Loads the corresponding block of V
+#     - Accumulates the weighted output
 #
-# This eliminates the scores/attention_weights tensor from VRAM entirely,
-# saving ~580KB per attention call × 364 calls = ~211MB of VRAM traffic.
+#   Online softmax maintains three running variables:
+#     m_i: running maximum score seen so far
+#     l_i: running sum of exp(scores - m_i)
+#     o_i: running weighted output accumulator
+#
+#   When a new block produces a new maximum m_new > m_i, previous
+#   results are rescaled by exp(m_i - m_new) to maintain correctness.
+#   This is mathematically equivalent to standard softmax but never
+#   requires all scores to be in memory simultaneously.
+#
+# Memory traffic: Read Q (once) + stream K,V (block by block) + Write O (once)
+# No intermediate tensors (scores, attention weights) in global memory.
+# Memory complexity: O(seq) instead of O(seq^2) for the attention matrix.
 # ============================================================================
 
 @triton.jit
-def flash_attention_causal_kernel(
+def flash_attention_tiled_kernel(
     q_ptr, k_ptr, v_ptr, output_ptr,
-    scale, seq_k, head_dim,
+    scale,
+    seq_k,          # actual number of key positions (for masking)
+    head_dim,       # actual head dimension (for masking)
     stride_q0, stride_q1, stride_q2,
     stride_k0, stride_k1, stride_k2,
     stride_v0, stride_v1, stride_v2,
     stride_o0, stride_o1, stride_o2,
-    offset,
+    offset,         # position offset for autoregressive causal mask
     IS_CAUSAL: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_D: tl.constexpr,
+    NUM_BLOCK_N: tl.constexpr,  # number of K/V blocks = ceil(seq_k_padded / BLOCK_N)
+    BLOCK_N: tl.constexpr,      # tile size along K/V sequence dimension
+    BLOCK_D: tl.constexpr,      # head dimension (padded to power of 2)
 ):
     """
-    FlashAttention: fully fused scores + causal mask + softmax + output.
-    Reads Q, K, V from global memory and writes output directly.
-    No intermediate tensors in global memory.
+    True FlashAttention: tiled K/V with online softmax.
+
     Grid: (batch_heads, seq_q)
+    Each program instance processes one query position and streams
+    through all K/V blocks, maintaining online softmax state.
     """
     pid_bh = tl.program_id(0)
     pid_q = tl.program_id(1)
 
-    offs_k = tl.arange(0, BLOCK_K)
     offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < head_dim
 
-    # (1) Load query vector — stays in registers for entire kernel
+    # ── (1) Load query vector ─────────────────────────────────────────
+    # Q is loaded once and stays in registers for the entire kernel.
+    # This is the key insight: Q is reused across all K/V blocks.
     q = tl.load(
         q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2,
-        mask=offs_d < head_dim, other=0.0,
+        mask=mask_d, other=0.0,
     )
 
-    # (2) Load key vectors and compute dot-product scores — all in registers
-    k = tl.load(
-        k_ptr + pid_bh * stride_k0 + offs_k[:, None] * stride_k1 + offs_d[None, :] * stride_k2,
-        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0,
-    )
-    scores = tl.sum(k * q[None, :], axis=1) * scale
+    # ── (2) Initialize online softmax state ───────────────────────────
+    # m_i: running max (initialized to large negative so first block dominates)
+    # l_i: running sum of exp(scores - m_i)
+    # o_i: running output accumulator (head_dim vector)
+    m_i = tl.full([], -1e20, dtype=tl.float32)
+    l_i = tl.full([], 0.0, dtype=tl.float32)
+    o_i = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-    # (3) Mask padding positions
-    mask_k = offs_k < seq_k
-    scores = tl.where(mask_k, scores, -float("inf"))
-
-    # (4) Apply causal mask in registers — zero memory cost
+    # Precompute causal position
     if IS_CAUSAL:
         current_pos = pid_q + offset
-        scores = tl.where(offs_k > current_pos, -float("inf"), scores)
 
-    # (5) Numerically stable softmax — entirely in registers
-    scores = scores - tl.max(scores, axis=0)
-    exp_s = tl.exp(scores)
-    attn_weights = exp_s / tl.sum(exp_s, axis=0)
+    # ── (3) Stream through K/V blocks ─────────────────────────────────
+    for block_idx in range(NUM_BLOCK_N):
+        block_start = block_idx * BLOCK_N
+        offs_n = block_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < seq_k
 
-    # (6) Load value vectors and compute weighted sum — in registers
-    #     This replaces the separate attention_output_kernel
-    v = tl.load(
-        v_ptr + pid_bh * stride_v0 + offs_k[:, None] * stride_v1 + offs_d[None, :] * stride_v2,
-        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0,
-    )
-    out = tl.sum(v * attn_weights[:, None], axis=0)
+        # ── Causal early-skip ─────────────────────────────────────
+        # If the entire block is beyond the causal boundary,
+        # all scores would be -inf and contribute nothing.
+        # We still process it (Triton doesn't support break), but
+        # the masking ensures zero contribution.
+        # For non-causal attention, all blocks are processed.
 
-    # (7) Single write to global memory — the only VRAM write in the entire attention
+        # ── (3a) Load K block: (BLOCK_N, BLOCK_D) ────────────────
+        k_block = tl.load(
+            k_ptr
+            + pid_bh * stride_k0
+            + offs_n[:, None] * stride_k1
+            + offs_d[None, :] * stride_k2,
+            mask=(mask_n[:, None]) & (mask_d[None, :]),
+            other=0.0,
+        )
+
+        # ── (3b) Compute partial scores: q @ k_block^T ───────────
+        # Result shape: (BLOCK_N,) — one score per key in this block
+        s_j = tl.sum(k_block * q[None, :], axis=1) * scale
+
+        # ── (3c) Mask out-of-bounds positions (padding) ───────────
+        s_j = tl.where(mask_n, s_j, -float("inf"))
+
+        # ── (3d) Apply causal mask for this block ─────────────────
+        # Keys at positions beyond current_pos get -inf score
+        if IS_CAUSAL:
+            s_j = tl.where(offs_n > current_pos, -float("inf"), s_j)
+
+        # ── (3e) Online softmax update ────────────────────────────
+        # This is the core of FlashAttention. We maintain a running
+        # max and sum, rescaling previous results when a new block
+        # produces a larger maximum.
+        #
+        # Algorithm (Milakov & Gimelshein, 2018; Dao et al., 2022):
+        #   m_new = max(m_i, max(s_j))
+        #   alpha = exp(m_i - m_new)      ← rescaling factor
+        #   l_i   = l_i * alpha + sum(exp(s_j - m_new))
+        #   o_i   = o_i * alpha + exp(s_j - m_new) @ V_block
+        #   m_i   = m_new
+
+        # New maximum across running state and current block
+        m_block = tl.max(s_j, axis=0)
+        m_new = tl.where(m_block > m_i, m_block, m_i)
+
+        # Rescale previous accumulator to account for new maximum
+        # If m_i was -1e20 (first iteration), alpha ≈ 0, which correctly
+        # zeroes out the initial state.
+        alpha = tl.exp(m_i - m_new)
+        l_i = l_i * alpha
+        o_i = o_i * alpha
+
+        # Compute attention weights for current block
+        p_j = tl.exp(s_j - m_new)
+
+        # Update running sum
+        l_i = l_i + tl.sum(p_j, axis=0)
+
+        # ── (3f) Load V block and accumulate output ───────────────
+        v_block = tl.load(
+            v_ptr
+            + pid_bh * stride_v0
+            + offs_n[:, None] * stride_v1
+            + offs_d[None, :] * stride_v2,
+            mask=(mask_n[:, None]) & (mask_d[None, :]),
+            other=0.0,
+        )
+
+        # Weighted sum: p_j (BLOCK_N,) broadcast × v_block (BLOCK_N, BLOCK_D)
+        # then reduce along BLOCK_N → (BLOCK_D,)
+        o_i = o_i + tl.sum(v_block * p_j[:, None], axis=0)
+
+        # Update running max
+        m_i = m_new
+
+    # ── (4) Final normalization ───────────────────────────────────────
+    # Divide accumulated output by the total softmax denominator.
+    # This completes the softmax: output = sum(exp(s-m)*v) / sum(exp(s-m))
+    o_i = o_i / l_i
+
+    # ── (5) Store output ──────────────────────────────────────────────
+    # Single write to global memory — the only VRAM write in the kernel.
     tl.store(
         output_ptr + pid_bh * stride_o0 + pid_q * stride_o1 + offs_d * stride_o2,
-        out, mask=offs_d < head_dim,
+        o_i, mask=mask_d,
     )
 
 
@@ -313,7 +394,13 @@ def next_power_of_two(x: int) -> int:
     return 1 << (x - 1).bit_length() if x > 0 else 1
 
 
-MAX_ATTENTION_DIM = 256
+# Increased from 256: tiled FlashAttention no longer needs the entire
+# sequence to fit in one tile, so we can support longer sequences.
+MAX_ATTENTION_DIM = 512
+
+# Tile size for K/V sequence dimension in FlashAttention.
+# Must be a power of 2. 64 balances register usage vs loop overhead.
+FLASH_BLOCK_N = 128
 
 
 def scaled_dot_product_attention(
@@ -327,14 +414,11 @@ def scaled_dot_product_attention(
     """
     Scaled dot-product attention using Triton kernels.
 
-    Three execution paths depending on optimization level:
-      1. FlashAttention (Opt 3): single kernel, no intermediate VRAM tensors
-      2. Fused scores+softmax (Opt 2): two kernels, scores tensor still in VRAM
-      3. Separate kernels (baseline): three kernels + PyTorch mask ops
-
-    Path selection:
-      - No explicit attention_mask → FlashAttention (handles both causal and non-causal)
-      - Explicit attention_mask    → Fallback to separate kernels
+    Execution paths:
+      1. FlashAttention (no explicit mask): single tiled kernel with online softmax.
+         Q loaded once, K/V streamed in blocks of FLASH_BLOCK_N.
+         No intermediate VRAM tensors. O(seq) memory instead of O(seq^2).
+      2. Fallback (explicit attention_mask): separate kernels, scores tensor in VRAM.
     """
     batch, num_heads, seq_q, head_dim = q.shape
     _, _, seq_k, _ = k.shape
@@ -342,12 +426,10 @@ def scaled_dot_product_attention(
     if scale is None:
         scale = 1.0 / np.sqrt(head_dim)
 
-    seq_k_padded = next_power_of_two(seq_k)
     head_dim_padded = next_power_of_two(head_dim)
 
     use_triton = (
         q.is_cuda
-        and seq_k_padded <= MAX_ATTENTION_DIM
         and head_dim_padded <= MAX_ATTENTION_DIM
     )
 
@@ -356,22 +438,23 @@ def scaled_dot_product_attention(
         k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
         v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
 
-        if seq_k_padded != seq_k or head_dim_padded != head_dim:
-            k_padded = torch.zeros(
-                (batch * num_heads, seq_k_padded, head_dim_padded),
-                dtype=torch.float32, device=q.device,
-            )
-            v_padded = torch.zeros_like(k_padded)
+        # Pad head_dim to power of 2 (required for tl.arange)
+        if head_dim_padded != head_dim:
             q_padded = torch.zeros(
                 (batch * num_heads, seq_q, head_dim_padded),
                 dtype=torch.float32, device=q.device,
             )
-            k_padded[:, :seq_k, :head_dim] = k_flat
-            v_padded[:, :seq_k, :head_dim] = v_flat
+            k_padded = torch.zeros(
+                (batch * num_heads, seq_k, head_dim_padded),
+                dtype=torch.float32, device=q.device,
+            )
+            v_padded = torch.zeros_like(k_padded)
             q_padded[:, :, :head_dim] = q_flat
+            k_padded[:, :, :head_dim] = k_flat
+            v_padded[:, :, :head_dim] = v_flat
+            q_flat = q_padded
             k_flat = k_padded
             v_flat = v_padded
-            q_flat = q_padded
 
         output = torch.empty(
             (batch * num_heads, seq_q, head_dim_padded),
@@ -384,43 +467,68 @@ def scaled_dot_product_attention(
         if not has_explicit_mask:
             # ============================================================
             # FLASH ATTENTION PATH (Optimization 3)
-            # Single kernel: Q,K,V → output. No intermediate VRAM tensors.
-            # Handles both causal (text decoder) and non-causal (audio encoder).
+            #
+            # True FlashAttention with tiled K/V and online softmax.
+            # Q is loaded once per query position. K and V are streamed
+            # in blocks of FLASH_BLOCK_N along the sequence dimension.
+            # Online softmax maintains running max and sum across blocks,
+            # rescaling the output accumulator when a new block changes
+            # the maximum. No intermediate tensors in VRAM.
+            #
+            # NUM_BLOCK_N is a constexpr so Triton can compile the loop
+            # efficiently. Different seq_k values trigger recompilation.
             # ============================================================
-            flash_attention_causal_kernel[grid](
+            num_blocks = triton.cdiv(seq_k, FLASH_BLOCK_N)
+
+            flash_attention_tiled_kernel[grid](
                 q_flat, k_flat, v_flat, output,
-                float(scale), seq_k_padded, head_dim_padded,
+                float(scale),
+                seq_k,
+                head_dim,
                 q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
                 k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
                 v_flat.stride(0), v_flat.stride(1), v_flat.stride(2),
                 output.stride(0), output.stride(1), output.stride(2),
                 0,  # offset for autoregressive decoding
                 IS_CAUSAL=is_causal,
-                BLOCK_K=seq_k_padded,
+                NUM_BLOCK_N=num_blocks,
+                BLOCK_N=FLASH_BLOCK_N,
                 BLOCK_D=head_dim_padded,
                 num_warps=4,
                 num_stages=2,
             )
         else:
             # ============================================================
-            # FALLBACK PATH: explicit attention_mask requires separate kernels
-            # because arbitrary mask values can't be computed from position alone
+            # FALLBACK PATH: explicit attention_mask needs separate kernels
             # ============================================================
+            seq_k_padded = next_power_of_two(seq_k)
             scores = torch.empty(
                 (batch * num_heads, seq_q, seq_k_padded),
                 dtype=torch.float32, device=q.device,
             )
 
+            # Pad K for fallback path (needs power-of-2 seq_k)
+            if seq_k_padded != seq_k:
+                k_fb = torch.zeros(
+                    (batch * num_heads, seq_k_padded, head_dim_padded),
+                    dtype=torch.float32, device=q.device,
+                )
+                k_fb[:, :seq_k, :head_dim] = k_flat[:, :, :head_dim] if head_dim_padded != head_dim else k_flat
+                v_fb = torch.zeros_like(k_fb)
+                v_fb[:, :seq_k, :head_dim] = v_flat[:, :, :head_dim] if head_dim_padded != head_dim else v_flat
+            else:
+                k_fb = k_flat
+                v_fb = v_flat
+
             attention_scores_kernel[grid](
-                q_flat, k_flat, scores,
+                q_flat, k_fb, scores,
                 float(scale), seq_k_padded, head_dim_padded,
                 q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
-                k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
+                k_fb.stride(0), k_fb.stride(1), k_fb.stride(2),
                 scores.stride(0), scores.stride(1), scores.stride(2),
                 BLOCK_K=seq_k_padded,
                 BLOCK_D=head_dim_padded,
-                num_warps=8,
-                num_stages=2,
+                num_warps=8, num_stages=2,
             )
 
             if seq_k_padded != seq_k:
@@ -434,9 +542,7 @@ def scaled_dot_product_attention(
                 scores = scores + mask[None, :, :]
 
             if attention_mask.ndim == 4:
-                attention_mask = attention_mask.reshape(
-                    batch * num_heads, seq_q, seq_k
-                )
+                attention_mask = attention_mask.reshape(batch * num_heads, seq_q, seq_k)
             if seq_k_padded != seq_k:
                 mask_padded = torch.zeros(
                     (batch * num_heads, seq_q, seq_k_padded),
@@ -455,10 +561,10 @@ def scaled_dot_product_attention(
             scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
 
             attention_output_kernel[grid](
-                scores, v_flat, output,
+                scores, v_fb, output,
                 seq_k_padded, head_dim_padded,
                 scores.stride(0), scores.stride(1), scores.stride(2),
-                v_flat.stride(0), v_flat.stride(1), v_flat.stride(2),
+                v_fb.stride(0), v_fb.stride(1), v_fb.stride(2),
                 output.stride(0), output.stride(1), output.stride(2),
                 BLOCK_K=seq_k_padded, BLOCK_D=head_dim_padded,
                 num_warps=4, num_stages=3,
@@ -469,7 +575,7 @@ def scaled_dot_product_attention(
 
         return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
 
-    # CPU/large-dimension fallback using PyTorch
+    # CPU/unsupported fallback using PyTorch
     scores = torch.einsum("bnqd,bnkd->bnqk", q, k) * scale
 
     if is_causal:
@@ -491,7 +597,7 @@ def scaled_dot_product_attention(
 
 
 if __name__ == "__main__":
-    print("Testing Triton Attention...")
+    print("Testing Triton Attention with FlashAttention...")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batch_size = 2
@@ -503,15 +609,32 @@ if __name__ == "__main__":
     k = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
     v = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
 
-    print("\nBasic attention:")
+    print("\nBasic attention (FlashAttention path):")
     output = scaled_dot_product_attention(q, k, v)
     print(f"  Output shape: {output.shape}")
 
-    print("\nCausal attention:")
+    # Verify against PyTorch reference
+    scores_ref = torch.einsum("bnqd,bnkd->bnqk", q.float(), k.float()) / (head_dim ** 0.5)
+    attn_ref = torch.softmax(scores_ref, dim=-1)
+    output_ref = torch.einsum("bnqk,bnkd->bnqd", attn_ref, v.float())
+    max_diff = (output.float() - output_ref).abs().max().item()
+    print(f"  Max diff vs PyTorch reference: {max_diff:.6f}")
+    assert max_diff < 1e-3, f"FlashAttention output differs from reference by {max_diff}"
+
+    print("\nCausal attention (FlashAttention path):")
     output_causal = scaled_dot_product_attention(q, k, v, is_causal=True)
     print(f"  Output shape: {output_causal.shape}")
 
-    print("\nWith attention mask:")
+    # Verify causal against reference
+    causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1) * -1e9
+    scores_ref_c = scores_ref + causal_mask[None, None, :, :]
+    attn_ref_c = torch.softmax(scores_ref_c, dim=-1)
+    output_ref_c = torch.einsum("bnqk,bnkd->bnqd", attn_ref_c, v.float())
+    max_diff_c = (output_causal.float() - output_ref_c).abs().max().item()
+    print(f"  Max diff vs PyTorch causal reference: {max_diff_c:.6f}")
+    assert max_diff_c < 1e-3, f"Causal FlashAttention differs from reference by {max_diff_c}"
+
+    print("\nWith attention mask (fallback path):")
     mask = torch.zeros(
         (batch_size, num_heads, seq_len, seq_len), dtype=torch.float32, device=device
     )
@@ -531,10 +654,23 @@ if __name__ == "__main__":
     output_gqa = attn(q, k_gqa, v_gqa)
     print(f"  Output shape: {output_gqa.shape}")
 
-    print("\nOutput statistics:")
-    print(f"  Mean: {float(output.mean()):.4f}")
-    print(f"  Std:  {float(output.std()):.4f}")
-    print(f"  Min:  {float(output.min()):.4f}")
-    print(f"  Max:  {float(output.max()):.4f}")
+    # Test with larger sequence to exercise multiple tiles
+    print("\nLarger sequence (multiple K/V tiles):")
+    seq_long = 256
+    q_long = torch.randn(1, 4, seq_long, head_dim, device=device)
+    k_long = torch.randn(1, 4, seq_long, head_dim, device=device)
+    v_long = torch.randn(1, 4, seq_long, head_dim, device=device)
+    output_long = scaled_dot_product_attention(q_long, k_long, v_long, is_causal=True)
+    print(f"  Output shape: {output_long.shape}")
 
-    print("\nTriton Attention working!")
+    # Verify long sequence
+    scores_long = torch.einsum("bnqd,bnkd->bnqk", q_long.float(), k_long.float()) / (head_dim ** 0.5)
+    causal_long = torch.triu(torch.ones(seq_long, seq_long, device=device), diagonal=1) * -1e9
+    scores_long = scores_long + causal_long[None, None, :, :]
+    attn_long = torch.softmax(scores_long, dim=-1)
+    output_long_ref = torch.einsum("bnqk,bnkd->bnqd", attn_long, v_long.float())
+    max_diff_long = (output_long.float() - output_long_ref).abs().max().item()
+    print(f"  Max diff vs reference (seq={seq_long}): {max_diff_long:.6f}")
+    assert max_diff_long < 1e-2, f"Long sequence FlashAttention differs by {max_diff_long}"
+
+    print("\nAll FlashAttention tests passed!")
